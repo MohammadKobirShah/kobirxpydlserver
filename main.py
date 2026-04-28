@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-=======================================================================
- Combined Video+Audio Direct Link Extractor (No FFmpeg, Pure Python)
+============================================================================
+ Combined Video+Audio Direct Link Extractor – No FFmpeg, Pure Python
  Author : Kobir Shah
- Features:
-   - Extracts single combined video+audio streams (no merging needed)
-   - Cookies file support (bypass YouTube bot via logged‑in state)
-   - SOCKS5 proxy support (bypass IP‑based blocking)
-   - CORS enabled for KaiOS WebView / browser apps
-   - Lightweight web UI for manual testing
-   - Deploy anywhere: Raspberry Pi, VPS, Render.com
-=======================================================================
+ Fixes : Handles invalid cookie formats gracefully, prevents file corruption.
+ Usage : python main.py --cookies cookies.txt --proxy socks5://127.0.0.1:9050
+============================================================================
 """
 
 import os
 import re
 import logging
 import argparse
+import sys
 from datetime import datetime
 
 import yt_dlp
@@ -25,8 +21,8 @@ from flask import Flask, request, jsonify, render_template_string
 # ---------------------- Configuration ----------------------
 PORT = int(os.environ.get("PORT", 8000))
 HOST = os.environ.get("HOST", "0.0.0.0")
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")      # path to cookies.txt
-PROXY = os.environ.get("PROXY", "socks5://test:test@103.159.218.218:1920")                     # e.g., socks5://127.0.0.1:9050
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
+PROXY = os.environ.get("PROXY", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +33,7 @@ logger = logging.getLogger("YtdlAPI")
 
 app = Flask(__name__)
 
-# ------------------ CORS ------------------
+# CORS
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -46,16 +42,27 @@ def add_cors_headers(response):
     return response
 
 
-# ------------------ yt-dlp Options Builder ------------------
+# ---------------- Cookies Validation ----------------
+def is_valid_netscape_cookies(filepath: str) -> bool:
+    """Check if the first line of the file is a valid Netscape header."""
+    if not filepath or not os.path.isfile(filepath):
+        return False
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        return first_line.startswith("# Netscape HTTP Cookie File") or \
+               first_line.startswith("# HTTP Cookie File")
+    except Exception:
+        return False
+
+
+# ---------------- yt-dlp Options Builder ----------------
 def get_ydl_opts(cookies_file: str = None, proxy: str = None) -> dict:
-    """
-    Build yt‑dlp options with optional cookies and proxy.
-    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": None,   # never merge, we pick already muxed streams
+        "merge_output_format": None,
         "skip_download": True,
         "noplaylist": True,
         "no_color": True,
@@ -63,35 +70,40 @@ def get_ydl_opts(cookies_file: str = None, proxy: str = None) -> dict:
         "retries": 3,
         "fragment_retries": 3,
     }
-    if cookies_file and os.path.isfile(cookies_file):
-        opts["cookiefile"] = cookies_file
-        logger.info(f"Using cookies: {cookies_file}")
+
+    # Validate and attach cookies file
+    if cookies_file:
+        if is_valid_netscape_cookies(cookies_file):
+            opts["cookiefile"] = cookies_file
+            # Prevent yt-dlp from writing back to the original file
+            opts["cookiejar"] = os.devnull  # discard any new cookies
+            logger.info(f"Using cookies: {cookies_file}")
+        else:
+            logger.warning(
+                f"Cookies file '{cookies_file}' is NOT in Netscape format – skipping. "
+                "You must export cookies as 'Netscape HTTP Cookie File' to bypass bot detection."
+            )
+
     if proxy:
         opts["proxy"] = proxy
         logger.info(f"Using proxy: {proxy}")
     return opts
 
 
-# ------------------ Sanitize Filename ------------------
+# ---------------- Sanitize Filename ----------------
 def safe_filename(title: str, ext: str) -> str:
-    """Remove characters illegal on KaiOS filesystem."""
     clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title).strip().rstrip('.') or "video"
     return f"{clean[:100]}.{ext}"
 
 
-# ------------------ Core Extraction ------------------
+# ---------------- Core Extraction ----------------
 def extract_direct_url(video_url: str, quality: str = "best",
                        cookies_file: str = None, proxy: str = None) -> dict:
-    """
-    Extract a single combined video+audio stream URL.
-    Raises ValueError on failure.
-    """
     ydl_opts = get_ydl_opts(cookies_file, proxy)
 
-    # Quality selection while keeping combined format
     if quality == "worst":
         ydl_opts["format"] = "worst[ext=mp4]/worst"
-    elif re.match(r'^\d+p$', quality):   # e.g., 720p
+    elif re.match(r'^\d+p$', quality):
         height = quality[:-1]
         ydl_opts["format"] = (
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -100,55 +112,38 @@ def extract_direct_url(video_url: str, quality: str = "best",
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-
-        # Keep only formats that contain both video and audio
-        combined = [
-            f for f in info.get("formats", [])
-            if f.get("vcodec") != "none" and f.get("acodec") != "none"
-        ]
+        combined = [f for f in info["formats"] if f.get("vcodec") != "none" and f.get("acodec") != "none"]
         if not combined:
             raise ValueError("No combined video+audio format available for this video.")
-
-        # Prefer mp4 container, then highest resolution
-        combined.sort(key=lambda f: (
-            0 if f.get("ext") == "mp4" else 1,
-            -f.get("height", 0)
-        ))
+        combined.sort(key=lambda f: (0 if f.get("ext") == "mp4" else 1, -f.get("height", 0)))
         chosen = combined[0]
-
         title = info.get("title", "unknown")
         ext = chosen.get("ext", "mp4")
-        filename = safe_filename(title, ext)
-
         return {
             "direct_url": chosen["url"],
             "title": title,
-            "filename": filename,
+            "filename": safe_filename(title, ext),
             "duration": info.get("duration"),
             "filesize": chosen.get("filesize"),
-            "format_id": chosen.get("format_id"),
-            "ext": ext,
-            "resolution": f"{chosen.get('width', '?')}x{chosen.get('height', '?')}",
+            "resolution": f"{chosen.get('width','?')}x{chosen.get('height','?')}",
         }
 
 
-# ------------------ API Endpoints ------------------
+# ---------------- API Endpoints ----------------
 @app.route("/extract", methods=["GET"])
 def extract():
-    """API endpoint: GET /extract?url=...&quality=best&cookies=...&proxy=..."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"success": False, "error": "Missing 'url' parameter"}), 400
 
     quality = request.args.get("quality", "best").strip().lower()
-    # Allow per-request override for cookies/proxy (useful for testing)
     cookies_param = request.args.get("cookies") or COOKIES_FILE
     proxy_param = request.args.get("proxy") or PROXY
 
     try:
-        result = extract_direct_url(url, quality, cookies_param, proxy_param)
-        logger.info(f"Extracted: {result['title']} [{result['resolution']}]")
-        return jsonify({"success": True, "data": result})
+        data = extract_direct_url(url, quality, cookies_param, proxy_param)
+        logger.info(f"Extracted: {data['title']} [{data['resolution']}]")
+        return jsonify({"success": True, "data": data})
     except ValueError as e:
         logger.warning(f"Extraction failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 400
@@ -157,18 +152,13 @@ def extract():
         return jsonify({"success": False, "error": "Internal server error"}), 500
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat(),
-        "credit": "Kobir Shah"
-    })
+    return jsonify({"status": "ok", "credit": "Kobir Shah"})
 
 
-# ------------------ Simple Web UI ------------------
-INDEX_HTML = """
-<!DOCTYPE html>
+# ---------------- Web UI ----------------
+INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -186,8 +176,7 @@ INDEX_HTML = """
     </style>
 </head>
 <body>
-    <h1>🎬 Combined Video+Audio Link Extractor</h1>
-    <p>Gives you a direct download URL (no merging required)</p>
+    <h1>🎬 Video+Audio Direct Link Extractor</h1>
     <label>Video URL:</label>
     <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
     <label>Quality:</label>
@@ -201,7 +190,7 @@ INDEX_HTML = """
     </select>
     <button onclick="fetchLink()">Get Direct Link</button>
     <div id="result"></div>
-    <div class="footer">Author: <strong>Kobir Shah</strong> · No FFmpeg needed · Cookies/Proxy supported</div>
+    <div class="footer">Author: <strong>Kobir Shah</strong> · No FFmpeg · Cookies/Proxy supported</div>
     <script>
         async function fetchLink() {
             const url = document.getElementById('url').value.trim();
@@ -226,35 +215,32 @@ INDEX_HTML = """
         }
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(INDEX_HTML)
 
 
-# ------------------ Main ------------------
+# ---------------- Main ----------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Combined Video+Audio Link Extractor for KaiOS (No FFmpeg)"
-    )
-    parser.add_argument("--cookies", help="Path to cookies.txt file for YouTube authentication")
-    parser.add_argument("--proxy", help="SOCKS5 proxy URL, e.g., socks5://127.0.0.1:9050")
-    parser.add_argument("--port", type=int, default=PORT, help="Server port")
-    parser.add_argument("--host", default=HOST, help="Server host")
+    parser = argparse.ArgumentParser(description="Combined Link Extractor (KaiOS)")
+    parser.add_argument("--cookies", help="Path to cookies.txt (Netscape format)")
+    parser.add_argument("--proxy", help="SOCKS5 proxy, e.g., socks5://127.0.0.1:9050")
+    parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--host", default=HOST)
     args = parser.parse_args()
 
     if args.cookies:
         COOKIES_FILE = args.cookies
-        logger.info(f"Cookies file set via --cookies: {COOKIES_FILE}")
-    else:
-        logger.warning("No cookies file provided – YouTube bot wall may block requests")
-
     if args.proxy:
         PROXY = args.proxy
-        logger.info(f"Proxy set via --proxy: {PROXY}")
-    else:
-        logger.info("No proxy configured (optional)")
+
+    if COOKIES_FILE and not is_valid_netscape_cookies(COOKIES_FILE):
+        logger.error(
+            f"Cookies file '{COOKIES_FILE}' is NOT in Netscape format. "
+            "Please export it as 'Netscape HTTP Cookie File' and restart."
+        )
+        sys.exit(1)  # Hard exit if explicitly provided but invalid
 
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
