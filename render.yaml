@@ -7,3 +7,5 @@ services:
     envVars:
       - key: COOKIES_FILE
         value: cookies.txt
+      - key: PROXY
+        value: socks5://test:test@103.159.218.218:1920
