@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-============================================================
- Combined Video+Audio Link Extractor (No FFmpeg, Pure Python)
+=======================================================================
+ Combined Video+Audio Direct Link Extractor (No FFmpeg, Pure Python)
  Author : Kobir Shah
- For KaiOS Downloader Apps
- Solves bot-detection by using browser cookies.
-============================================================
+ Features:
+   - Extracts single combined video+audio streams (no merging needed)
+   - Cookies file support (bypass YouTube bot via logged‑in state)
+   - SOCKS5 proxy support (bypass IP‑based blocking)
+   - CORS enabled for KaiOS WebView / browser apps
+   - Lightweight web UI for manual testing
+   - Deploy anywhere: Raspberry Pi, VPS, Render.com
+=======================================================================
 """
 
 import os
@@ -20,7 +25,8 @@ from flask import Flask, request, jsonify, render_template_string
 # ---------------------- Configuration ----------------------
 PORT = int(os.environ.get("PORT", 8000))
 HOST = os.environ.get("HOST", "0.0.0.0")
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "")  # path to cookies.txt
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")      # path to cookies.txt
+PROXY = os.environ.get("PROXY", "socks5://test:test@103.159.218.218:1920")                     # e.g., socks5://127.0.0.1:9050
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +37,7 @@ logger = logging.getLogger("YtdlAPI")
 
 app = Flask(__name__)
 
-# ---------------- CORS (for KaiOS WebView) -----------------
+# ------------------ CORS ------------------
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -41,13 +47,15 @@ def add_cors_headers(response):
 
 
 # ------------------ yt-dlp Options Builder ------------------
-def get_ydl_opts(cookies_file: str = None):
-    """Create yt-dlp options, optionally with a cookies file."""
+def get_ydl_opts(cookies_file: str = None, proxy: str = None) -> dict:
+    """
+    Build yt‑dlp options with optional cookies and proxy.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": None,   # never merge, we only pick pre-muxed streams
+        "merge_output_format": None,   # never merge, we pick already muxed streams
         "skip_download": True,
         "noplaylist": True,
         "no_color": True,
@@ -57,33 +65,33 @@ def get_ydl_opts(cookies_file: str = None):
     }
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
-        logger.info(f"Using cookies from: {cookies_file}")
+        logger.info(f"Using cookies: {cookies_file}")
+    if proxy:
+        opts["proxy"] = proxy
+        logger.info(f"Using proxy: {proxy}")
     return opts
 
 
 # ------------------ Sanitize Filename ------------------
 def safe_filename(title: str, ext: str) -> str:
-    """Remove illegal characters for KaiOS filesystem."""
-    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)
-    clean = clean.strip().rstrip('.') or "video"
-    if len(clean) > 100:
-        clean = clean[:100]
-    return f"{clean}.{ext}"
+    """Remove characters illegal on KaiOS filesystem."""
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title).strip().rstrip('.') or "video"
+    return f"{clean[:100]}.{ext}"
 
 
-# ------------------ Core Extraction Function ------------------
+# ------------------ Core Extraction ------------------
 def extract_direct_url(video_url: str, quality: str = "best",
-                       cookies_file: str = None) -> dict:
+                       cookies_file: str = None, proxy: str = None) -> dict:
     """
-    Returns a direct download URL for a combined video+audio stream.
+    Extract a single combined video+audio stream URL.
     Raises ValueError on failure.
     """
-    ydl_opts = get_ydl_opts(cookies_file)
+    ydl_opts = get_ydl_opts(cookies_file, proxy)
 
-    # Adjust format selector based on quality
+    # Quality selection while keeping combined format
     if quality == "worst":
         ydl_opts["format"] = "worst[ext=mp4]/worst"
-    elif re.match(r'^\d+p$', quality):  # e.g., 720p
+    elif re.match(r'^\d+p$', quality):   # e.g., 720p
         height = quality[:-1]
         ydl_opts["format"] = (
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -91,12 +99,9 @@ def extract_direct_url(video_url: str, quality: str = "best",
         )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=False)
-        except yt_dlp.utils.DownloadError as e:
-            raise ValueError(f"Cannot process URL: {e}")
+        info = ydl.extract_info(video_url, download=False)
 
-        # Filter only formats that contain both video and audio
+        # Keep only formats that contain both video and audio
         combined = [
             f for f in info.get("formats", [])
             if f.get("vcodec") != "none" and f.get("acodec") != "none"
@@ -111,7 +116,6 @@ def extract_direct_url(video_url: str, quality: str = "best",
         ))
         chosen = combined[0]
 
-        # Metadata
         title = info.get("title", "unknown")
         ext = chosen.get("ext", "mp4")
         filename = safe_filename(title, ext)
@@ -125,26 +129,24 @@ def extract_direct_url(video_url: str, quality: str = "best",
             "format_id": chosen.get("format_id"),
             "ext": ext,
             "resolution": f"{chosen.get('width', '?')}x{chosen.get('height', '?')}",
-            "vcodec": chosen.get("vcodec"),
-            "acodec": chosen.get("acodec"),
         }
 
 
 # ------------------ API Endpoints ------------------
 @app.route("/extract", methods=["GET"])
 def extract():
-    """Main endpoint: ?url=VIDEO_URL&quality=best&cookies=/path/to/cookies"""
+    """API endpoint: GET /extract?url=...&quality=best&cookies=...&proxy=..."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"success": False, "error": "Missing 'url' parameter"}), 400
 
     quality = request.args.get("quality", "best").strip().lower()
-    # Allow overriding cookies via query param (useful for testing)
-    cookies_param = request.args.get("cookies")
-    cookies_path = cookies_param or COOKIES_FILE
+    # Allow per-request override for cookies/proxy (useful for testing)
+    cookies_param = request.args.get("cookies") or COOKIES_FILE
+    proxy_param = request.args.get("proxy") or PROXY
 
     try:
-        result = extract_direct_url(url, quality, cookies_path)
+        result = extract_direct_url(url, quality, cookies_param, proxy_param)
         logger.info(f"Extracted: {result['title']} [{result['resolution']}]")
         return jsonify({"success": True, "data": result})
     except ValueError as e:
@@ -164,8 +166,9 @@ def health():
     })
 
 
-# ------------------ Minimal Web UI (for testing) ------------------
-INDEX_HTML = """<!DOCTYPE html>
+# ------------------ Simple Web UI ------------------
+INDEX_HTML = """
+<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -175,7 +178,7 @@ INDEX_HTML = """<!DOCTYPE html>
         body { font-family: sans-serif; max-width: 600px; margin: 2em auto; padding: 1em; }
         h1 { color: #0d6efd; }
         label { font-weight: bold; }
-        input, select, button { width: 100%; padding: 0.5em; margin: 0.5em 0; }
+        input, select, button { width: 100%; padding: 0.5em; margin: 0.5em 0; box-sizing: border-box; }
         button { background: #0d6efd; color: white; border: none; cursor: pointer; }
         button:hover { background: #0b5ed7; }
         #result { margin-top: 1em; padding: 1em; background: #e9ecef; white-space: pre-wrap; word-break: break-all; }
@@ -183,7 +186,8 @@ INDEX_HTML = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>🎬 Video+Audio Direct Link Extractor</h1>
+    <h1>🎬 Combined Video+Audio Link Extractor</h1>
+    <p>Gives you a direct download URL (no merging required)</p>
     <label>Video URL:</label>
     <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
     <label>Quality:</label>
@@ -197,7 +201,7 @@ INDEX_HTML = """<!DOCTYPE html>
     </select>
     <button onclick="fetchLink()">Get Direct Link</button>
     <div id="result"></div>
-    <div class="footer">Author: <strong>Kobir Shah</strong> | No FFmpeg required</div>
+    <div class="footer">Author: <strong>Kobir Shah</strong> · No FFmpeg needed · Cookies/Proxy supported</div>
     <script>
         async function fetchLink() {
             const url = document.getElementById('url').value.trim();
@@ -222,17 +226,21 @@ INDEX_HTML = """<!DOCTYPE html>
         }
     </script>
 </body>
-</html>"""
+</html>
+"""
 
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(INDEX_HTML)
 
 
-# ------------------ Command Line Entry Point ------------------
+# ------------------ Main ------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="YtDlp Combined Link Extractor (No FFmpeg)")
-    parser.add_argument("--cookies", help="Path to cookies.txt file (for avoiding bot detection)")
+    parser = argparse.ArgumentParser(
+        description="Combined Video+Audio Link Extractor for KaiOS (No FFmpeg)"
+    )
+    parser.add_argument("--cookies", help="Path to cookies.txt file for YouTube authentication")
+    parser.add_argument("--proxy", help="SOCKS5 proxy URL, e.g., socks5://127.0.0.1:9050")
     parser.add_argument("--port", type=int, default=PORT, help="Server port")
     parser.add_argument("--host", default=HOST, help="Server host")
     args = parser.parse_args()
@@ -241,6 +249,12 @@ if __name__ == "__main__":
         COOKIES_FILE = args.cookies
         logger.info(f"Cookies file set via --cookies: {COOKIES_FILE}")
     else:
-        logger.info("No cookies file provided – may fail for YouTube bot checks")
+        logger.warning("No cookies file provided – YouTube bot wall may block requests")
+
+    if args.proxy:
+        PROXY = args.proxy
+        logger.info(f"Proxy set via --proxy: {PROXY}")
+    else:
+        logger.info("No proxy configured (optional)")
 
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
