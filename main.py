@@ -1,156 +1,150 @@
 #!/usr/bin/env python3
 """
-====================================================================
-Video+Audio Direct Link Extractor API (Pure Python, Zero Dependencies)
-Author : Kobir Shah
-License: MIT
-For KaiOS Downloader Apps – Returns a single combined video+audio URL
-====================================================================
+============================================================
+ Combined Video+Audio Link Extractor (No FFmpeg, Pure Python)
+ Author : Kobir Shah
+ For KaiOS Downloader Apps
+ Solves bot-detection by using browser cookies.
+============================================================
 """
 
 import os
 import re
 import logging
-import urllib.parse
+import argparse
 from datetime import datetime
-from functools import wraps
 
 import yt_dlp
 from flask import Flask, request, jsonify, render_template_string
 
-# ---------- Configuration ----------
+# ---------------------- Configuration ----------------------
 PORT = int(os.environ.get("PORT", 8000))
 HOST = os.environ.get("HOST", "0.0.0.0")
-LOG_LEVEL = logging.INFO
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "")  # path to cookies.txt
 
-# ---------- Logging Setup ----------
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("YtdlAPI")
 
-# ---------- Flask App ----------
 app = Flask(__name__)
 
-# ---------- CORS Decorator ----------
+# ---------------- CORS (for KaiOS WebView) -----------------
+@app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
-app.after_request(add_cors_headers)
 
-# ---------- yt-dlp Options (combined video+audio only) ----------
-YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",  
-    # This ensures we get a combined mp4 if possible; otherwise any combined format.
-    "merge_output_format": None,   # no post-processing
-    "skip_download": True,
-    "noplaylist": True,
-    "extract_flat": False,
-    "no_color": True,
-    "socket_timeout": 15,
-    "retries": 3,
-    "fragment_retries": 3,
-}
+# ------------------ yt-dlp Options Builder ------------------
+def get_ydl_opts(cookies_file: str = None):
+    """Create yt-dlp options, optionally with a cookies file."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": None,   # never merge, we only pick pre-muxed streams
+        "skip_download": True,
+        "noplaylist": True,
+        "no_color": True,
+        "socket_timeout": 15,
+        "retries": 3,
+        "fragment_retries": 3,
+    }
+    if cookies_file and os.path.isfile(cookies_file):
+        opts["cookiefile"] = cookies_file
+        logger.info(f"Using cookies from: {cookies_file}")
+    return opts
 
-# ---------- Helper: sanitize filename ----------
+
+# ------------------ Sanitize Filename ------------------
 def safe_filename(title: str, ext: str) -> str:
-    """Remove unsafe characters, keep spaces, limit length."""
-    title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)  # remove forbidden chars
-    title = title.strip().rstrip('.')
-    if not title:
-        title = "video"
-    max_len = 100  # KaiOS filesystem friendly
-    if len(title) > max_len:
-        title = title[:max_len]
-    return f"{title}.{ext}"
+    """Remove illegal characters for KaiOS filesystem."""
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)
+    clean = clean.strip().rstrip('.') or "video"
+    if len(clean) > 100:
+        clean = clean[:100]
+    return f"{clean}.{ext}"
 
-# ---------- Core Extraction Logic ----------
-def extract_direct_url(video_url: str, quality: str = "best") -> dict:
+
+# ------------------ Core Extraction Function ------------------
+def extract_direct_url(video_url: str, quality: str = "best",
+                       cookies_file: str = None) -> dict:
     """
-    Extract a direct download link for a combined video+audio format.
-    Parameters:
-        video_url : str
-        quality   : one of "best", "worst", "720p", "1080p", "480p" etc.
-    Returns:
-        dict with keys: direct_url, title, duration, filesize, filename, ext, format_note, resolution
+    Returns a direct download URL for a combined video+audio stream.
+    Raises ValueError on failure.
     """
-    opts = YDL_OPTS.copy()
-    # Apply quality selection while still keeping combined streams
+    ydl_opts = get_ydl_opts(cookies_file)
+
+    # Adjust format selector based on quality
     if quality == "worst":
-        format_selector = "worst[ext=mp4]/worst"
+        ydl_opts["format"] = "worst[ext=mp4]/worst"
     elif re.match(r'^\d+p$', quality):  # e.g., 720p
         height = quality[:-1]
-        # Prefer mp4 with that height, combined streams
-        format_selector = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best[height<={height}]"
-    else:
-        format_selector = opts.get("format", "best[ext=mp4]/best")
+        ydl_opts["format"] = (
+            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"best[height<={height}][ext=mp4]/best[height<={height}]"
+        )
 
-    opts["format"] = format_selector
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(video_url, download=False)
         except yt_dlp.utils.DownloadError as e:
             raise ValueError(f"Cannot process URL: {e}")
 
-        # Filter combined formats (both video and audio codec)
-        combined_formats = [
+        # Filter only formats that contain both video and audio
+        combined = [
             f for f in info.get("formats", [])
             if f.get("vcodec") != "none" and f.get("acodec") != "none"
         ]
-        if not combined_formats:
-            raise ValueError("No combined video+audio format found. Try another video.")
+        if not combined:
+            raise ValueError("No combined video+audio format available for this video.")
 
-        # Sort by preference: mp4 first, then by quality (height)
-        def sort_key(f):
-            is_mp4 = 1 if f.get("ext") == "mp4" else 0
-            height = f.get("height") or 0
-            return (-is_mp4, -height)
+        # Prefer mp4 container, then highest resolution
+        combined.sort(key=lambda f: (
+            0 if f.get("ext") == "mp4" else 1,
+            -f.get("height", 0)
+        ))
+        chosen = combined[0]
 
-        combined_formats.sort(key=sort_key)
-        chosen = combined_formats[0]  # best mp4/combined
-
-        # Extract useful info
+        # Metadata
         title = info.get("title", "unknown")
         ext = chosen.get("ext", "mp4")
         filename = safe_filename(title, ext)
-        direct_url = chosen["url"]
-        filesize = chosen.get("filesize") or chosen.get("filesize_approx")
-        duration = info.get("duration")
 
         return {
-            "direct_url": direct_url,
+            "direct_url": chosen["url"],
             "title": title,
             "filename": filename,
-            "duration": duration,
-            "filesize": filesize,
+            "duration": info.get("duration"),
+            "filesize": chosen.get("filesize"),
             "format_id": chosen.get("format_id"),
             "ext": ext,
-            "resolution": f"{chosen.get('width', 0)}x{chosen.get('height', 0)}" if chosen.get('width') else "",
-            "format_note": chosen.get("format_note", ""),
+            "resolution": f"{chosen.get('width', '?')}x{chosen.get('height', '?')}",
             "vcodec": chosen.get("vcodec"),
             "acodec": chosen.get("acodec"),
         }
 
-# ---------- API Endpoints ----------
+
+# ------------------ API Endpoints ------------------
 @app.route("/extract", methods=["GET"])
 def extract():
-    """Main endpoint: ?url=VIDEO_URL&quality=best"""
+    """Main endpoint: ?url=VIDEO_URL&quality=best&cookies=/path/to/cookies"""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"success": False, "error": "Missing 'url' parameter"}), 400
 
     quality = request.args.get("quality", "best").strip().lower()
+    # Allow overriding cookies via query param (useful for testing)
+    cookies_param = request.args.get("cookies")
+    cookies_path = cookies_param or COOKIES_FILE
 
     try:
-        result = extract_direct_url(url, quality)
+        result = extract_direct_url(url, quality, cookies_path)
         logger.info(f"Extracted: {result['title']} [{result['resolution']}]")
         return jsonify({"success": True, "data": result})
     except ValueError as e:
@@ -160,91 +154,93 @@ def extract():
         logger.exception("Unexpected error")
         return jsonify({"success": False, "error": "Internal server error"}), 500
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
-        "powered_by": "yt-dlp + Flask",
         "credit": "Kobir Shah"
     })
 
-# ---------- Simple Web UI for manual testing ----------
-INDEX_HTML = """
-<!DOCTYPE html>
+
+# ------------------ Minimal Web UI (for testing) ------------------
+INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YtDlp Link Extractor - Kobir Shah</title>
+    <title>Direct Link Extractor – Kobir Shah</title>
     <style>
-        body { font-family: sans-serif; margin: 2em; background: #f8f9fa; color: #212529; }
-        .container { max-width: 600px; margin: auto; background: white; padding: 2em; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        h1 { text-align: center; color: #0d6efd; }
-        label { font-weight: bold; display: block; margin-top: 1em; }
-        input[type="text"], select { width: 100%; padding: 0.5em; margin-top: 0.3em; border: 1px solid #ced4da; border-radius: 5px; }
-        button { margin-top: 1.5em; width: 100%; padding: 0.7em; background: #0d6efd; color: white; border: none; border-radius: 5px; font-size: 1.1em; cursor: pointer; }
+        body { font-family: sans-serif; max-width: 600px; margin: 2em auto; padding: 1em; }
+        h1 { color: #0d6efd; }
+        label { font-weight: bold; }
+        input, select, button { width: 100%; padding: 0.5em; margin: 0.5em 0; }
+        button { background: #0d6efd; color: white; border: none; cursor: pointer; }
         button:hover { background: #0b5ed7; }
-        #result { margin-top: 1.5em; padding: 1em; background: #e9ecef; border-radius: 5px; white-space: pre-wrap; word-break: break-all; display: none; }
-        .footer { text-align: center; margin-top: 2em; font-size: 0.85em; color: #6c757d; }
+        #result { margin-top: 1em; padding: 1em; background: #e9ecef; white-space: pre-wrap; word-break: break-all; }
+        .footer { margin-top: 2em; font-size: 0.85em; color: #6c757d; text-align: center; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🎬 Direct Link Extractor</h1>
-        <p style="text-align:center;">Get a single video+audio (no merging needed)</p>
-        <label for="url">Video URL</label>
-        <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
-        <label for="quality">Quality</label>
-        <select id="quality">
-            <option value="best">Best available</option>
-            <option value="1080p">1080p</option>
-            <option value="720p">720p</option>
-            <option value="480p">480p</option>
-            <option value="360p">360p</option>
-            <option value="worst">Worst available</option>
-        </select>
-        <button onclick="fetchLink()">Get Direct Link</button>
-        <div id="result"></div>
-    </div>
-    <div class="footer">
-        Created by <strong>Kobir Shah</strong> | Powered by yt-dlp & Flask | No FFmpeg required
-    </div>
+    <h1>🎬 Video+Audio Direct Link Extractor</h1>
+    <label>Video URL:</label>
+    <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
+    <label>Quality:</label>
+    <select id="quality">
+        <option value="best">Best available</option>
+        <option value="1080p">1080p</option>
+        <option value="720p">720p</option>
+        <option value="480p">480p</option>
+        <option value="360p">360p</option>
+        <option value="worst">Worst available</option>
+    </select>
+    <button onclick="fetchLink()">Get Direct Link</button>
+    <div id="result"></div>
+    <div class="footer">Author: <strong>Kobir Shah</strong> | No FFmpeg required</div>
     <script>
         async function fetchLink() {
             const url = document.getElementById('url').value.trim();
             const quality = document.getElementById('quality').value;
-            const resultDiv = document.getElementById('result');
-            if (!url) { resultDiv.style.display = 'block'; resultDiv.textContent = 'Please enter a URL'; return; }
-            resultDiv.style.display = 'block';
-            resultDiv.textContent = 'Loading...';
+            const resDiv = document.getElementById('result');
+            if (!url) { resDiv.textContent = 'Please enter a URL'; return; }
+            resDiv.textContent = 'Loading...';
             try {
                 const res = await fetch(`/extract?url=${encodeURIComponent(url)}&quality=${quality}`);
                 const data = await res.json();
                 if (data.success) {
-                    resultDiv.innerHTML = `<strong>Title:</strong> ${data.data.title}<br>
-                                           <strong>Resolution:</strong> ${data.data.resolution}<br>
-                                           <strong>File:</strong> ${data.data.filename}<br>
-                                           <strong>Size:</strong> ${data.data.filesize ? (data.data.filesize/1024/1024).toFixed(2) + ' MB' : 'Unknown'}<br>
-                                           <strong>Direct URL:</strong><br><a href="${data.data.direct_url}" target="_blank">${data.data.direct_url}</a>`;
+                    resDiv.innerHTML = `<strong>Title:</strong> ${data.data.title}<br>
+                                        <strong>Resolution:</strong> ${data.data.resolution}<br>
+                                        <strong>Filename:</strong> ${data.data.filename}<br>
+                                        <strong>Direct URL:</strong><br><a href="${data.data.direct_url}" target="_blank">${data.data.direct_url}</a>`;
                 } else {
-                    resultDiv.textContent = 'Error: ' + data.error;
+                    resDiv.textContent = 'Error: ' + data.error;
                 }
             } catch (err) {
-                resultDiv.textContent = 'Request failed: ' + err.message;
+                resDiv.textContent = 'Request failed: ' + err.message;
             }
         }
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(INDEX_HTML)
 
-# ---------- Main ----------
+
+# ------------------ Command Line Entry Point ------------------
 if __name__ == "__main__":
-    logger.info(f"Starting YtDlp Link Extractor API on {HOST}:{PORT}")
-    logger.info("Author: Kobir Shah – Pure Python, No FFmpeg, Combined streams only")
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    parser = argparse.ArgumentParser(description="YtDlp Combined Link Extractor (No FFmpeg)")
+    parser.add_argument("--cookies", help="Path to cookies.txt file (for avoiding bot detection)")
+    parser.add_argument("--port", type=int, default=PORT, help="Server port")
+    parser.add_argument("--host", default=HOST, help="Server host")
+    args = parser.parse_args()
+
+    if args.cookies:
+        COOKIES_FILE = args.cookies
+        logger.info(f"Cookies file set via --cookies: {COOKIES_FILE}")
+    else:
+        logger.info("No cookies file provided – may fail for YouTube bot checks")
+
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
